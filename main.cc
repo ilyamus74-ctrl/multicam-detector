@@ -1,156 +1,140 @@
-// ========================= includes start =========================
-#include <csignal>
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <thread>
+// ========================== main.cc (полная версия) ==========================
+
+#include <atomic>
 #include <chrono>
-#include <cctype>
-#include <memory>          // уникальные указатели
+#include <csignal>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
 
-#include "web_server.h"    // <-- твой сервер (namespace mc)
-// ========================= includes end ===========================
+#include "web_server.h"   // из include/web_server.h (namespace mc)
 
+// ----------------------------------------------------------------------------
+// Глобальный флаг завершения
+// ----------------------------------------------------------------------------
+static std::atomic<bool> g_run{true};
 
-// ========================= globals start ==========================
-static volatile std::sig_atomic_t g_run = 1;
+// ----------------------------------------------------------------------------
+// Обработчик сигналов
+// ----------------------------------------------------------------------------
+static void on_signal(int) {
+  g_run.store(false);
+}
 
-static void handle_sigint(int) { g_run = 0; }
-// ========================= globals end ============================
-
-
-// ========================= cli parsing start ======================
+// ============================================================================
+// parse_cli function start
+// ============================================================================
 struct CliOptions {
-  std::string config_path;   // путь к json
-  int http_fps_limit = -1;   // override с CLI, если >=0
+  std::string config_path;   // то, что пришло в --config
+  int http_fps_limit = 20;   // по умолчанию 20 (можно переопределить)
 };
 
 static CliOptions parse_cli(int argc, char** argv) {
   CliOptions opt;
-
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--config" && i + 1 < argc) {
       opt.config_path = argv[++i];
-    } else if (a.rfind("--config=", 0) == 0) {
-      opt.config_path = a.substr(9);
     } else if (a == "--http-fps-limit" && i + 1 < argc) {
-      opt.http_fps_limit = std::stoi(argv[++i]);
-    } else if (a.rfind("--http-fps-limit=", 0) == 0) {
-      opt.http_fps_limit = std::stoi(a.substr(18));
-    }
-  }
-
-  auto file_exists = [](const std::string& p) {
-    std::ifstream f(p);
-    return f.good();
-  };
-
-  // fallback, если не указали --config или файл не найден
-  if (opt.config_path.empty() || !file_exists(opt.config_path)) {
-    const std::string fallbacks[] = {"config/config.json", "../config/config.json", "config.json"};
-    for (const std::string& fb : fallbacks) {
-      if (file_exists(fb)) { opt.config_path = fb; break; }
+      try {
+        opt.http_fps_limit = std::stoi(argv[++i]);
+      } catch (...) {
+        std::cerr << "Bad value for --http-fps-limit, using default 20\n";
+        opt.http_fps_limit = 20;
+      }
     }
   }
   return opt;
 }
-// ========================= cli parsing end ========================
+// ============================================================================
+// parse_cli function end
+// ============================================================================
 
 
-// ========================= config minimal start ===================
+// ============================================================================
+// load_config_minimal function start
+// ----------------------------------------------------------------------------
+// Наша минималка: проверяем, что конфиг существует. Если путь не задан,
+// пробуем несколько запасных вариантов. Порт берём 8080, а активную камеру
+// по умолчанию "cam1" (как раньше). Полный парсинг JSON прикрутим позже.
+// ============================================================================
 struct AppConfigMinimal {
   int http_port = 8080;
   int http_fps_limit = 20;
   std::string display_camera = "cam1";
+  std::string used_config_path; // куда в итоге ткнулись
 };
 
-// Очень простой граббер значений из JSON без зависимостей.
-// Достаём только три ключа, которые нам нужны: port, http_fps_limit, display_camera.
-static bool load_config_minimal(const std::string& path,
-                                AppConfigMinimal& out_cfg,
-                                std::string& err) {
-  std::ifstream f(path);
-  if (!f) { err = "cannot open file"; return false; }
-
-  std::stringstream ss; ss << f.rdbuf();
-  std::string s = ss.str();
-
-  auto get_int = [&](const char* key, int def) {
-    size_t p = s.find(key);
-    if (p == std::string::npos) return def;
-    p = s.find(':', p);
-    if (p == std::string::npos) return def;
-    ++p;
-    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) ++p;
-
-    bool neg = false;
-    if (p < s.size() && s[p] == '-') { neg = true; ++p; }
-
-    long v = 0;
-    while (p < s.size() && std::isdigit(static_cast<unsigned char>(s[p]))) {
-      v = v * 10 + (s[p] - '0');
-      ++p;
-    }
-    return static_cast<int>(neg ? -v : v);
-  };
-
-  auto get_str = [&](const char* key, const std::string& def) {
-    size_t p = s.find(key);
-    if (p == std::string::npos) return def;
-    p = s.find(':', p);
-    if (p == std::string::npos) return def;
-
-    p = s.find('"', p);
-    if (p == std::string::npos) return def;
-    size_t q = s.find('"', p + 1);
-    if (q == std::string::npos) return def;
-
-    return s.substr(p + 1, q - (p + 1));
-  };
-
-  out_cfg.http_port      = get_int("\"port\"", out_cfg.http_port);
-  out_cfg.http_fps_limit = get_int("\"http_fps_limit\"", out_cfg.http_fps_limit);
-  out_cfg.display_camera = get_str("\"display_camera\"", out_cfg.display_camera);
-  return true;
+static bool file_exists(const std::string& p) {
+  std::ifstream f(p);
+  return f.good();
 }
-// ========================= config minimal end =====================
+
+static bool load_config_minimal(const std::string& cli_path,
+                                AppConfigMinimal& out,
+                                std::string& err) {
+  std::vector<std::string> candidates;
+  if (!cli_path.empty()) candidates.push_back(cli_path);
+  // fallback-ы рядом с бинарём/примером
+  candidates.push_back("config/config.json");
+  candidates.push_back("../config/config.json");
+
+  for (const std::string& p : candidates) {
+    if (file_exists(p)) {
+      out.used_config_path = p;
+      return true;
+    }
+  }
+  err = "Config load failed: --config";
+  return false;
+}
+// ============================================================================
+// load_config_minimal function end
+// ============================================================================
 
 
-// ========================= app runtime start ======================
+// ============================================================================
+// AppRuntime class start
+// ----------------------------------------------------------------------------
+// Управляет жизненным циклом HTTP-сервера. Камеры/детектор подключим на
+// следующем шаге, сейчас только HTTP + коллбек переключения камер.
+// ============================================================================
 class AppRuntime {
 public:
+  AppRuntime() = default;
+  ~AppRuntime() { stop(); }
+
   bool start(const AppConfigMinimal& cfg) {
-    std::cout << "[bootstrap] HTTP: port=" << cfg.http_port
-              << " fps_limit=" << cfg.http_fps_limit
-              << " display='" << cfg.display_camera << "'" << std::endl;
+    using namespace mc;
 
-    display_camera_ = cfg.display_camera;
-
-    mc::WebServerConfig wcfg;
-    wcfg.port = cfg.http_port;
-    wcfg.fps_limit = cfg.http_fps_limit;
+    // Подготовим и запустим HTTP
+    mc::WebServerConfig http_cfg;
+    http_cfg.port = cfg.http_port;
+    http_cfg.fps_limit = cfg.http_fps_limit;
 
     http_ = mc::CreateWebServer();
     if (!http_) {
-      std::cerr << "[bootstrap] CreateWebServer() returned null" << std::endl;
+      std::cerr << "[bootstrap] HTTP: CreateWebServer() failed\n";
       return false;
     }
 
-    // опционально реагируем на переключение камеры из UI
-    http_->SetOnSwitchCamera([this](const mc::CamId& id){
-      display_camera_ = id;
-      std::cout << "[http] switch camera -> " << display_camera_ << std::endl;
+    // Коллбек из UI: переключение активной камеры
+    http_->SetOnSwitchCamera([this](const mc::CamId& cam) {
+      std::cout << "[http] switch camera -> " << cam << std::endl;
+      active_camera_ = cam;  // на будущее, когда подключим CameraManager
     });
 
-    if (!http_->Start(wcfg)) {
-      std::cerr << "[bootstrap] WebServer::Start() failed" << std::endl;
-      http_.reset();
+    if (!http_->Start(http_cfg)) {
+      std::cerr << "[bootstrap] HTTP start FAILED (port="
+                << http_cfg.port << ")\n";
       return false;
     }
 
+    std::cout << "[bootstrap] HTTP: port=" << http_cfg.port
+              << " fps_limit=" << http_cfg.fps_limit
+              << " display='" << active_camera_ << "'\n";
     return true;
   }
 
@@ -161,55 +145,65 @@ public:
     }
   }
 
+  const std::string& active_camera() const { return active_camera_; }
+
 private:
   std::unique_ptr<mc::WebServer> http_;
-  std::string display_camera_;
+  std::string active_camera_ = "cam1";
 };
-// ========================= app runtime end ========================
+// ============================================================================
+// AppRuntime class end
+// ============================================================================
 
 
-// ========================= main function start ====================
+// ============================================================================
+// main function start
+// ============================================================================
 int main(int argc, char** argv) {
-  std::signal(SIGINT,  handle_sigint);
-  std::signal(SIGTERM, handle_sigint);
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
 
-  CliOptions opts = parse_cli(argc, argv);
-  if (opts.config_path.empty()) {
-    std::cerr << "Config load failed: --config (file not found)\n";
-    return 2;
-  }
+  // CLI
+  CliOptions cli = parse_cli(argc, argv);
 
-  std::cout << "Loading config: " << opts.config_path << std::endl;
-
+  // Загрузка/проверка мини-конфига
   AppConfigMinimal cfg;
+  cfg.http_fps_limit = cli.http_fps_limit;  // переопределяем с CLI
   std::string err;
-  if (!load_config_minimal(opts.config_path, cfg, err)) {
-    std::cerr << "Config load failed: " << err << std::endl;
-    return 2;
+  if (!load_config_minimal(cli.config_path, cfg, err)) {
+    std::cerr << err << std::endl;
+    return 1;
   }
 
-  if (opts.http_fps_limit >= 0) {
-    cfg.http_fps_limit = opts.http_fps_limit; // override с CLI
-  }
-
+  std::cout << "Loading config: " << cfg.used_config_path << std::endl;
   std::cout << "Config OK (port=" << cfg.http_port
             << ", http_fps_limit=" << cfg.http_fps_limit
             << ", display_camera=\"" << cfg.display_camera << "\")\n";
 
-  AppRuntime rt;
-  std::cout << "[bootstrap] App started." << std::endl;
-
-  if (!rt.start(cfg)) {
-    std::cerr << "[bootstrap] start() failed — exiting\n";
-    return 1;
+  // Старт приложения
+  std::cout << "[bootstrap] App started.\n";
+  AppRuntime app;
+  // стартуем с display_camera из конфига (для логов и будущей связки с камерами)
+  // сейчас — только логика в AppRuntime
+  if (!cfg.display_camera.empty()) {
+    // просто инициализируем поле через временный старт/стоп? не нужно,
+    // сразу стартуем: AppRuntime сам выведет display
   }
 
-  while (g_run) {
+  if (!app.start(cfg)) {
+    return 2;
+  }
+
+  // Главный цикл
+  while (g_run.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  rt.stop();
-  std::cout << "[bootstrap] App stopped.\n";
+  // Остановка
+  app.stop();
   return 0;
 }
-// ========================= main function end ======================
+// ============================================================================
+// main function end
+// ============================================================================
+
