@@ -1,11 +1,10 @@
-
 #pragma once
 #include <vector>
 #include <memory>
 #include <functional>
 #include "common_types.h"
 #include "camera_worker.h"
-#include "v4l2_profiles.h"
+#include "v4l2_profiles.h"   // ← вот это нужно
 
 namespace mc {
 
@@ -44,20 +43,13 @@ class CameraManager {
 public:
   using OnLocalTracks = std::function<void(const CamId&, std::vector<Track>&&, usec_t)>;
 
-  // ДОБАВЛЕНО: коллбэк для готового JPEG кадра
-  using OnRenderedFrame = std::function<
-      void(const CamId& /*cam*/, const void* /*jpg*/, size_t /*sz*/, usec_t /*ts_us*/)
-  >;
-
   virtual ~CameraManager() = default;
 
   virtual bool Start(const AppConfig& cfg) = 0;
   virtual void Stop() = 0;
 
-  // видеопоток в JPEG (сырой MJPG с камеры на данном шаге)
-  virtual void SetOnRenderedFrame(OnRenderedFrame cb) = 0;
-
-  // локальные треки на камере
+  // Хотплаг событийно: менеджер сам создаёт/убивает CameraWorker
+  // Внешний мир подписывается на локальные треки
   virtual void SetOnLocalTracks(OnLocalTracks cb) = 0;
 
   // Список активных камер/состояний
