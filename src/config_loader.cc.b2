@@ -38,6 +38,8 @@ static std::optional<int> j_get_int(const json& j, const char* key) {
 bool LoadConfigFromFile(const std::string& path, AppConfig* out) {
   if (!out) return false;
 
+  // значения по умолчанию — уже есть в полях AppConfig/HttpConfig/CameraConfig
+
   std::string txt;
   if (!read_all_text(path, txt)) {
     std::cerr << "[config] cannot open: " << path << "\n";
@@ -60,18 +62,13 @@ bool LoadConfigFromFile(const std::string& path, AppConfig* out) {
     if (auto v = j_get_string(h, "display_camera")) out->http.display_camera = *v;
   }
 
-  // -------- profiles (необязательны) --------
+  // -------- profiles (необязательны, оставляем дефолты, если чего-то нет) --------
   if (root.contains("profiles") && root["profiles"].is_object()) {
     const auto& p = root["profiles"];
     auto fill_profile = [&](const char* name, V4L2Profile& dst){
       if (!p.contains(name) || !p[name].is_object()) return;
       const auto& pj = p[name];
-
-      // В вашей структуре поле называется exposure_abs.
-      // Поддержим и "exposure_abs", и "exposure" из JSON.
-      if (auto v = j_get_int(pj, "exposure_abs")) dst.exposure_abs = *v;
-      else if (auto v = j_get_int(pj, "exposure")) dst.exposure_abs = *v;
-
+      if (auto v = j_get_int(pj, "exposure"))   dst.exposure   = *v;
       if (auto v = j_get_int(pj, "gain"))       dst.gain       = *v;
       if (auto v = j_get_int(pj, "gamma"))      dst.gamma      = *v;
       if (auto v = j_get_int(pj, "saturation")) dst.saturation = *v;
@@ -81,10 +78,13 @@ bool LoadConfigFromFile(const std::string& path, AppConfig* out) {
     fill_profile("dark",   out->profiles.dark);
   }
 
-  // profile_switch — берём только то, что точно есть в структуре (hysteresis)
+  // profile_switch может лежать на верхнем уровне (как у тебя в примере)
   if (root.contains("profile_switch") && root["profile_switch"].is_object()) {
     const auto& sw = root["profile_switch"];
+    // аккуратно достанем то, что сможем; остальное оставим по умолчанию
     if (auto v = j_get_int(sw, "hysteresis")) out->profiles.sw.hysteresis = *v;
+    // если в ProfileSwitchSettings есть ещё поля (пороги и т.п.) — заполним их позже,
+    // сейчас можно оставить по умолчанию, чтобы не падало.
   }
 
   // -------- cameras --------
@@ -106,13 +106,13 @@ bool LoadConfigFromFile(const std::string& path, AppConfig* out) {
       // preferred { w, h, pixfmt, fps }
       if (cj.contains("preferred") && cj["preferred"].is_object()) {
         const auto& pr = cj["preferred"];
-        if (auto v = j_get_int(pr, "w"))        c.w = *v;
-        if (auto v = j_get_int(pr, "h"))        c.h = *v;
-        if (auto v = j_get_int(pr, "fps"))      c.fps = *v;
+        if (auto v = j_get_int(pr, "w"))     c.w = *v;
+        if (auto v = j_get_int(pr, "h"))     c.h = *v;
+        if (auto v = j_get_int(pr, "fps"))   c.fps = *v;
         if (auto v = j_get_string(pr, "pixfmt")) c.pixfmt = *v;
       }
 
-      if (auto v = j_get_int(cj, "npu_worker")) c.npu_worker = *v;
+      if (auto v = j_get_int(cj, "npu_worker"))      c.npu_worker = *v;
       if (cj.contains("auto_profiles") && cj["auto_profiles"].is_boolean())
         c.auto_profiles = cj["auto_profiles"].get<bool>();
 
@@ -120,7 +120,9 @@ bool LoadConfigFromFile(const std::string& path, AppConfig* out) {
     }
   }
 
+  // всё ок
   return true;
 }
 
 } // namespace mc
+
