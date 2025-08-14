@@ -81,33 +81,19 @@ static bool load_config_minimal(const std::string& path,
   auto get_int = [&](const char* key, int def) {
     size_t p = s.find(key);
     if (p == std::string::npos) return def;
-    p = s.find(':', p);
+    p = s.find_first_of("0123456789", p);
     if (p == std::string::npos) return def;
-    ++p;
-    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) ++p;
-
-    bool neg = false;
-    if (p < s.size() && s[p] == '-') { neg = true; ++p; }
-
     long v = 0;
     while (p < s.size() && std::isdigit(static_cast<unsigned char>(s[p]))) {
-      v = v * 10 + (s[p] - '0');
-      ++p;
+      v = v * 10 + (s[p] - '0'); ++p;
     }
-    return static_cast<int>(neg ? -v : v);
+    return static_cast<int>(v);
   };
-
   auto get_str = [&](const char* key, const std::string& def) {
     size_t p = s.find(key);
     if (p == std::string::npos) return def;
-    p = s.find(':', p);
-    if (p == std::string::npos) return def;
-
-    p = s.find('"', p);
-    if (p == std::string::npos) return def;
-    size_t q = s.find('"', p + 1);
-    if (q == std::string::npos) return def;
-
+    p = s.find('"', p + 1); if (p == std::string::npos) return def;
+    size_t q = s.find('"', p + 1); if (q == std::string::npos) return def;
     return s.substr(p + 1, q - (p + 1));
   };
 
