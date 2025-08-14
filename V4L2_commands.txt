@@ -1,0 +1,82 @@
+Чтобы убедиться, что параметры читаются, можешь добавить:
+
+std::cout << "🎯 box_thresh: " << box_thresh << ", nms_thresh: " << nms_thresh << "\n";
+
+✅ Резюме
+Аргумент	Назначение
+argv[1]	Путь к модели
+argv[2]	Размер входа (обычно 640)
+argv[3]	Индекс камеры (опц.)
+argv[4]	Классы через запятую (опц.)
+argv[5]	box_thresh (опц.)
+argv[6]	nms_thresh (опц.)
+
+./main yolov8m_640.rknn 640 0 person,dog,car 0.2 0.5
+
+# v4l2-ctl --get-fmt-video -d /dev/video1
+Format Video Capture:
+    Width/Height      : 640/480
+    Pixel Format      : 'MJPG' (Motion-JPEG)
+    Field             : None
+    Bytes per Line    : 0
+    Size Image        : 614400
+    Colorspace        : sRGB
+    Transfer Function : Rec. 709
+    YCbCr/HSV Encoding: ITU-R 601
+    Quantization      : Default (maps to Full Range)
+    Flags             : 
+(rknn_env) root@rock-5b-plus:~# 
+
+v4l2-ctl -d /dev/video1 --set-fmt-video=width=1280,height=720,pixelformat=MJPG
+
+v4l2-ctl -d /dev/video1 --list-formats-ext
+
+v4l2-ctl -d /dev/video1 \
+  --set-ctrl=brightness=128,contrast=128,saturation=128,hue=128,white_balance_automatic=1,gamma=133,gain=0,\
+power_line_frequency=1,sharpness=110,backlight_compensation=1,auto_exposure=3
+# exposure_time_absolute сейчас не трогаем — в AUTO он не активен
+
+
+# ручная экспозиция
+v4l2-ctl -d /dev/video1 --set-ctrl=auto_exposure=1
+# подбери вручную: выдержка (не слишком большая, напр. 150..260), усиление и гамму
+v4l2-ctl -d /dev/video1 --set-ctrl=exposure_time_absolute=220,gain=16,gamma=180,brightness=150
+# ч/б (по желанию)
+v4l2-ctl -d /dev/video1 --set-ctrl=saturation=0
+
+#тесть скорости камеры
+v4l2-ctl -d /dev/video1 --set-fmt-video=width=640,height=480,pixelformat=MJPG \
+         --stream-mmap --stream-to=/dev/null --stream-count=300
+
+
+v4l2-ctl -d /dev/video1 --set-ctrl=\
+brightness=128,contrast=128,saturation=128,hue=128,\
+white_balance_automatic=1,gamma=133,gain=0,\
+power_line_frequency=1,backlight_compensation=1,\
+auto_exposure=3
+
+# ч/б + базовая светлотная коррекция
+v4l2-ctl -d /dev/video1 --set-ctrl=saturation=0,gamma=180,brightness=150
+
+
+# авто (aperture priority) — у тебя это значение 3
+v4l2-ctl -d /dev/video1 --set-ctrl=auto_exposure=3
+# можно подсказать алгоритму:
+v4l2-ctl -d /dev/video1 --set-ctrl=backlight_compensation=2
+v4l2-ctl -d /dev/video1 --set-ctrl=gain=16
+
+# ручной режим экспозиции (у тебя именно это и вернуло 30 fps)
+v4l2-ctl -d /dev/video1 --set-ctrl=auto_exposure=1
+
+# сделать светлее: увеличить выдержку (шаги пробуй 220..500)
+v4l2-ctl -d /dev/video1 --set-ctrl=exposure_time_absolute=300
+
+# при необходимости добавить усиление (шумнее, но светлее)
+v4l2-ctl -d /dev/video1 --set-ctrl=gain=32
+
+# помогает на тёмной сцене
+v4l2-ctl -d /dev/video1 --set-ctrl=backlight_compensation=2
+
+# подтянуть гамму/яркость, если в «ч/б» стало мрачновато
+v4l2-ctl -d /dev/video1 --set-ctrl=gamma=180,brightness=150
+

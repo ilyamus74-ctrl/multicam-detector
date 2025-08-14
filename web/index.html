@@ -1,0 +1,17 @@
+<section>
+  <h3>Live — webcam detection</h3>
+  <img id="live" src="/api/stream.mjpg" style="max-width:100%; border:1px solid #ccc; border-radius:8px;">
+  <details style="margin-top:8px">
+    <summary>Последние детекции (JSON)</summary>
+    <pre id="meta" style="max-height:200px; overflow:auto"></pre>
+  </details>
+</section>
+<script>
+  // необязательная подсветка: дергаем /api/last.json раз в секунду
+  setInterval(async () => {
+    try {
+      const j = await (await fetch('/api/last.json', {cache:'no-store'})).json();
+      document.getElementById('meta').textContent = JSON.stringify(j, null, 2);
+    } catch(e) {}
+  }, 1000);
+</script>

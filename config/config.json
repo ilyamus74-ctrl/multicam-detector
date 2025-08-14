@@ -1,0 +1,33 @@
+{
+  "http": { "port": 8080, "http_fps_limit": 20, "display_camera": "cam1" },
+  "npu": { "workers": [
+    {"core": "0"}, {"core": "1"}, {"core": "2"}
+  ]},
+  "profiles": {
+    "bright":   {"exposure": 3, "gain": 0,  "gamma": 120, "saturation": 128},
+    "indoor":   {"exposure": 6, "gain": 16, "gamma": 133, "saturation": 128},
+    "dark":     {"exposure": 12,"gain": 32, "gamma": 150, "saturation": 0}
+  },
+  "profile_switch": {
+    "metric": "mean_luma",
+    "bright_if":  "> 180",
+    "dark_if":    "< 60",
+    "hysteresis": 10
+  },
+  "cameras": [
+    {
+      "id": "cam1",
+      "match": {"by_id_contains": "HD USB Camera"},
+      "preferred": {"w": 1280, "h": 720, "pixfmt": "MJPG", "fps": 30},
+      "npu_worker": 0,
+      "auto_profiles": true
+    },
+    {
+      "id": "cam2",
+      "match": {"by_id_contains": "UVC Camera #2"},
+      "preferred": {"w": 1280, "h": 720, "pixfmt": "MJPG", "fps": 30},
+      "npu_worker": 1,
+      "auto_profiles": true
+    }
+  ]
+}

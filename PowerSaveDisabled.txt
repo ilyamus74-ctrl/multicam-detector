@@ -1,0 +1,57 @@
+ага, похоже, плата иногда уходит/пытается уйти в sleep и это бьёт по сборке (линкер валится), а GUI+display-manager ещё подливает масла. Сделаем её «хэдлесс» и полностью запретим сон.
+Что сделать (коротко)
+
+    Запретить все режимы сна/гибернации (systemd):
+
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+    Выключить автодействия logind (на всякий):
+
+sudo sed -i 's/^#\?IdleAction=.*/IdleAction=ignore/' /etc/systemd/logind.conf
+sudo sed -i 's/^#\?IdleActionSec=.*/IdleActionSec=0/' /etc/systemd/logind.conf
+sudo sed -i 's/^#\?HandleSuspendKey=.*/HandleSuspendKey=ignore/' /etc/systemd/logind.conf
+sudo sed -i 's/^#\?HandleHibernateKey=.*/HandleHibernateKey=ignore/' /etc/systemd/logind.conf
+sudo sed -i 's/^#\?HandlePowerKey=.*/HandlePowerKey=ignore/' /etc/systemd/logind.conf
+sudo systemctl restart systemd-logind
+
+    Отключить X/GUI и грузиться в консоль (headless):
+
+# посмотреть, какой дисплей-менеджер активен
+systemctl status display-manager
+
+# отключить его (подставь gdm3 / lightdm / sddm — что покажет строка выше)
+sudo systemctl disable --now gdm3
+
+# сделать режим по умолчанию — консольный (без X)
+sudo systemctl set-default multi-user.target
+
+# переключиться прямо сейчас (без ребута)
+sudo systemctl isolate multi-user.target
+
+    Вернуть GUI: sudo systemctl set-default graphical.target && sudo systemctl enable --now gdm3
+
+    (Опционально) отключить «умные» энергосервисы, если стоят:
+
+sudo systemctl disable --now tlp || true
+sudo systemctl disable --now power-profiles-daemon || true
+
+    (Опционально) убедиться, что USB-автослип не мешает камере:
+
+# временно (до перезагрузки)
+echo -1 | sudo tee /sys/module/usbcore/parameters/autosuspend > /dev/null
+
+    Собирать в tmux/screen, чтобы SSH-разрыв не обрывал сборку:
+
+sudo apt-get install -y tmux
+tmux new -s build
+# ... внутри tmux запускай cmake/make, выйдешь — сессия живёт
+
+Как проверить, что сон действительно ушёл
+
+journalctl -b | grep -i -E 'suspend|sleep|hibernat|PM:'
+
+После маскировки target’ов этих записей не должно появляться при простое.
+
+Если хочешь оставить GUI установленным, но чтобы он не запускался на старте — достаточно п.3 (set-default multi-user.target). Работать по SSH — идеально.
+
+Ну и раз уж сборка стала стабильной после ребута — очень советую дальше работать через tmux и держать сборки вне GUI-сеанса. Если что-то ещё будет намекать на «сон», пингани journalctl за последние минуты — подскажу, что именно дергает.

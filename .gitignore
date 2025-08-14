@@ -1,0 +1,28 @@
+# CMake / build
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+
+# Generated
+compile_commands.json
+
+# Data & models (если большие — лучше через LFS)
+models/
+*.rknn
+*.onnx
+*.bin
+*.engine
+*.weights
+*.pt
