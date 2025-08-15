@@ -196,8 +196,6 @@ public:
     st.last_jpeg.assign((const uint8_t*)jpg_data, (const uint8_t*)jpg_data + jpg_size);
     st.last_ts_us = ts_us;
     st.bytes_total += jpg_size;
-
-    if (active_cam_.empty()) active_cam_ = cam; // если активная ещё не задана — выберем первую «пошедшую»
     cv_.notify_all();
   }
 
@@ -220,60 +218,24 @@ private:
   };
 
   void mount_routes() {
-    // index — список камер + view активной камеры
+    // index
     srv_.Get("/", [this](const httplib::Request&, httplib::Response& res){
       std::string html;
       {
         std::lock_guard<std::mutex> lk(m_);
         html += "<!doctype html><html><head><meta charset='utf-8'><title>cams</title>"
-                "<style>body{font-family:sans-serif;margin:20px}"
-                ".row{display:flex;gap:20px;align-items:flex-start}"
-                ".panel{border:1px solid #ddd;padding:10px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.06)}"
-                ".btn{padding:6px 10px;border:1px solid #888;border-radius:8px;background:#fafafa;cursor:pointer;margin-right:8px}"
-                ".btn:hover{background:#f0f0f0}</style></head><body>";
-
-        html += "<div class='row'><div class='panel'><h3>Active view</h3>"
-                "<div id='av-wrap'><img id='active' src='' style='max-width:640px;max-height:480px'/></div>"
-                "<div style='margin-top:8px'><button class='btn' onclick='chg()'>refresh</button>"
-                "<a class='btn' href='/api/health' target='_blank'>Health</a></div>"
-                "</div>"
-                "<div class='panel'><h3>Cameras</h3>";
+                "<style>body{font-family:sans-serif;margin:20px} a{display:block;margin:6px 0}</style>"
+                "</head><body><h3>Cameras</h3>";
         if (cams_.empty()) html += "<p>no cameras yet</p>";
-        else for (auto& kv : cams_) {
-          html += "<div><a href='/cam/" + kv.first + "'>/cam/" + kv.first + "</a> "
-                  "<button class='btn' onclick=\"setActive('" + kv.first + "')\">set active</button></div>";
+        else {
+          for (auto& kv : cams_) html += "<a href='/cam/" + kv.first + "'>/cam/" + kv.first + "</a>";
         }
-        html += "</div></div>";
-
-        html += R"HTML(
-<script>
-async function pullActive(){
-  try{
-    const r = await fetch('/api/active', {cache:'no-store'});
-    if (!r.ok) return;
-    const j = await r.json();
-    const cam = j.active||'';
-    const el = document.getElementById('active');
-    if (cam){
-      const url = '/api/stream/'+encodeURIComponent(cam)+'.mjpg';
-      if (el.src !== location.origin + url) el.src = url;
-    }
-  }catch(e){}
-}
-function setActive(cam){
-  fetch('/api/active/'+encodeURIComponent(cam),{method:'POST'}).then(()=>pullActive());
-}
-function chg(){ pullActive(); }
-setInterval(pullActive, 1500);
-pullActive();
-</script>)HTML";
-
-        html += "</body></html>";
+        html += "<hr/><p><a href='/api/health'>/api/health</a></p></body></html>";
       }
       res.set_content(html, "text/html");
     });
 
-    // cam page (overlay)
+    // cam page
     srv_.Get(R"(/cam/(.+))", [this](const httplib::Request& req, httplib::Response& res){
       res.set_content(render_cam_page(req.matches[1]), "text/html");
     });
@@ -285,7 +247,6 @@ pullActive();
       j["http_fps_limit"] = http_fps_limit_;
       {
         std::lock_guard<std::mutex> lk(m_);
-        j["active"] = active_cam_;
         auto& arr = j["cams"] = json::array();
         for (auto& kv : cams_) {
           json c;
@@ -311,7 +272,7 @@ pullActive();
       res.set_content(std::string((const char*)jpg.data(), jpg.size()), "image/jpeg");
     });
 
-    // last meta (для overlay)
+    // last meta
     auto serve_last_json = [this](const std::string& cam, httplib::Response& res){
       json out;
       std::vector<GlobalObject> snapshot;
@@ -348,27 +309,14 @@ pullActive();
       serve_last_json(req.get_param_value("cam"), res);
     });
 
-    // active: GET/POST
-    srv_.Get("/api/active", [this](const httplib::Request&, httplib::Response& res){
-      json j;
-      std::lock_guard<std::mutex> lk(m_);
-      j["active"] = active_cam_;
-      res.set_content(j.dump(), "application/json");
-    });
-
+    // set active
     srv_.Post(R"(/api/active/(.+))", [this](const httplib::Request& req, httplib::Response& res){
-      const std::string cam = req.matches[1];
-      {
-        std::lock_guard<std::mutex> lk(m_);
-        active_cam_ = cam;
-      }
-      std::cout << "[http] set active -> " << cam << std::endl;
       OnSwitchCamera cb;
       {
         std::lock_guard<std::mutex> lk(m_);
         cb = on_switch_;
       }
-      if (cb) cb(cam);
+      if (cb) cb(req.matches[1]);
       res.set_content("ok", "text/plain");
     });
 
@@ -432,7 +380,6 @@ private:
   std::vector<GlobalObject>           last_meta_;
   usec_t                              last_meta_ts_{0};
   WebServer::OnSwitchCamera           on_switch_;
-  std::string                         active_cam_;   // <<<< новое
 
   // sync
   std::mutex              m_;

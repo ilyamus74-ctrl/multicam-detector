@@ -1,0 +1,408 @@
+
+// src/web_server.cc
+#include "web_server.h"
+#include "httplib.h"
+#include "nlohmann/json.hpp"
+
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <deque>
+#include <chrono>
+#include <iostream>
+
+using json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+namespace mc {
+
+class SimpleWebServer : public WebServer {
+public:
+  SimpleWebServer() = default;
+  ~SimpleWebServer() override { Stop(); }
+
+  // --- WebServer interface ---
+  bool Start(const WebServerConfig& cfg) override {
+    std::lock_guard<std::mutex> lk(m_);
+    if (running_) return true;
+
+    port_ = cfg.port;
+    http_fps_limit_ = cfg.fps_limit > 0 ? cfg.fps_limit : 0;
+
+    // CORS + таймауты
+    srv_.set_keep_alive_max_count(100);
+    srv_.set_read_timeout(10, 0);
+    srv_.set_write_timeout(10, 0);
+    srv_.set_payload_max_length(2 * 1024 * 1024);
+    srv_.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
+      res.set_header("Access-Control-Allow-Origin", "*");
+      res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      return httplib::Server::HandlerResponse::Unhandled;
+    });
+    srv_.Options(".*", [](const httplib::Request&, httplib::Response&){});
+
+    mount_routes();
+
+    running_ = true;
+    th_ = std::thread([this]{
+      std::cout << "[http] listen on 0.0.0.0:" << port_ << "\n";
+      srv_.listen("0.0.0.0", port_);
+    });
+    return true;
+  }
+
+  void Stop() override {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!running_) return;
+      running_ = false;
+    }
+    srv_.stop();
+    cv_.notify_all();
+    if (th_.joinable()) th_.join();
+  }
+
+  void PushRenderedFrame(const CamId& cam, const void* jpg_data, size_t jpg_size, usec_t ts_us) override {
+    if (!jpg_data || jpg_size == 0) return;
+    std::lock_guard<std::mutex> lk(m_);
+    auto& st = cams_[cam];
+    st.last_jpeg.assign((const uint8_t*)jpg_data, (const uint8_t*)jpg_data + jpg_size);
+    st.last_ts_us = ts_us;
+    st.bytes_total += jpg_size;
+    cv_.notify_all();
+  }
+
+  void PushMeta(const std::vector<GlobalObject>& objs, usec_t ts_us) override {
+    std::lock_guard<std::mutex> lk(m_);
+    last_meta_ = objs;
+    last_meta_ts_ = ts_us;
+  }
+
+  void SetOnSwitchCamera(OnSwitchCamera cb) override {
+    std::lock_guard<std::mutex> lk(m_);
+    on_switch_ = std::move(cb);
+  }
+
+private:
+  struct CamState {
+    std::vector<uint8_t> last_jpeg;
+    usec_t               last_ts_us{0};
+    uint64_t             bytes_total{0};
+  };
+
+  // --- HTTP routes ---
+  void mount_routes() {
+    // index: список камер
+    srv_.Get("/", [this](const httplib::Request&, httplib::Response& res){
+      std::string html;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        html += "<!doctype html><html><head><meta charset='utf-8'><title>cams</title>";
+        html += "<style>body{font-family:sans-serif;margin:20px} a{display:block;margin:6px 0}</style>";
+        html += "</head><body><h3>Cameras</h3>";
+        if (cams_.empty()) {
+          html += "<p>no cameras yet</p>";
+        } else {
+          for (auto& kv : cams_) {
+            html += "<a href='/cam/" + kv.first + "'>/cam/" + kv.first + "</a>";
+          }
+        }
+        html += "<hr/><p><a href='/api/health'>/api/health</a></p>";
+        html += "</body></html>";
+      }
+      res.set_content(html, "text/html");
+    });
+
+    // страница с оверлеем
+    srv_.Get(R"(/cam/(.+))", [this](const httplib::Request& req, httplib::Response& res){
+      const std::string cam = req.matches[1];
+      std::string html;
+      html += "<!doctype html><html><head><meta charset='utf-8'><title>"+cam+"</title>";
+      html += R"(<style>
+      body{margin:20px;font-family:sans-serif}
+      .row{display:flex;gap:16px;align-items:flex-start}
+      .panel{border:1px solid #ddd;padding:10px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+      #wrap{position:relative;display:inline-block}
+      #overlay{position:absolute;left:0;top:0}
+      .btn{padding:6px 10px;border:1px solid #888;border-radius:8px;background:#fafafa;cursor:pointer}
+      .btn:hover{background:#f0f0f0}
+      .stats{font:12px/1.2 monospace;margin-top:6px}
+      </style></head><body>)";
+
+      html += "<div class='row'>";
+      html += "<div class='panel'><div id='wrap'>";
+      html += "<img id='stream' src='/api/stream/" + cam + R"(.mjpg' alt='stream' />";
+      html += "<canvas id='overlay'></canvas>";
+      html += "</div>";
+      html += "<div class='stats'><div id='info'>info...</div></div>";
+      html += "<div style='margin-top:8px'>";
+      html += "<button class='btn' onclick='setActive()'>Set active</button> ";
+      html += "<a class='btn' href='/api/frame/"+cam+".jpg' target='_blank'>Last JPG</a> ";
+      html += "<a class='btn' href='/api/health' target='_blank'>Health</a>";
+      html += "</div></div>";
+
+      html += "<div class='panel'><b>Tips</b><ul>";
+      html += "<li>Overlay без рекодинга: боксы берутся из <code>/api/last.json?cam="+cam+"</code></li>";
+      html += "<li>MJPEG лимитируется <code>http_fps_limit</code></li>";
+      html += "<li>Кнопка Set active = POST /api/active/"+cam+"</li>";
+      html += "</ul></div></div>";
+
+      html += R"(<script>
+const cam = ")" + cam + R"(";
+const img = document.getElementById('stream');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+
+function fitCanvasToImg(){
+  const w = img.clientWidth || img.naturalWidth;
+  const h = img.clientHeight || img.naturalHeight;
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = w+'px'; canvas.style.height = h+'px';
+}
+
+function drawBoxes(items, iw, ih){
+  fitCanvasToImg();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const sx = canvas.width / iw;
+  const sy = canvas.height / ih;
+  ctx.lineWidth = 2; ctx.strokeStyle = '#00b0ff'; ctx.font = '12px monospace'; ctx.fillStyle='#00b0ff';
+  items.forEach(o=>{
+    const b = o.box;
+    const x = b.x * sx, y = b.y * sy, w = b.w * sx, h = b.h * sy;
+    ctx.strokeRect(x, y, w, h);
+    const text = (o.id!==undefined?('#'+o.id+' '):'') + (o.cls!==undefined?('c'+o.cls+' '):'') + (o.score!==undefined?(Math.round(o.score*100)+'%'):'');
+    if (text){
+      const pad=2; const tw = ctx.measureText(text).width+6; const th=14;
+      ctx.fillRect(x, Math.max(0,y-th), tw, th);
+      ctx.fillStyle='#fff'; ctx.fillText(text, x+3, Math.max(10,y-2));
+      ctx.fillStyle='#00b0ff';
+    }
+  });
+}
+
+let lastTs=0, fps=0, lastFpsT=performance.now(), frames=0;
+
+async function poll(){
+  try{
+    const r = await fetch('/api/last.json?cam='+encodeURIComponent(cam), {cache:'no-store'});
+    if (!r.ok) throw 0;
+    const j = await r.json();
+    const iw = j.image_w || j.w || 0;
+    const ih = j.image_h || j.h || 0;
+    const ts = j.ts_us || 0;
+    const items = j.items || j.dets || [];
+    drawBoxes(items, iw||img.naturalWidth||640, ih||img.naturalHeight||480);
+    // fps
+    if (ts && ts!=lastTs){ frames++; lastTs = ts; }
+    const now = performance.now();
+    if (now - lastFpsT > 1000) { fps = frames; frames=0; lastFpsT = now; }
+    info.textContent = 'items='+(items.length||0)+'  overlay_fps='+fps+'  ts_us='+ts;
+  }catch(e){
+    // ignore
+  }finally{
+    setTimeout(poll, 100);
+  }
+}
+
+function setActive(){
+  fetch('/api/active/'+encodeURIComponent(cam), {method:'POST'}).then(()=>{}).catch(()=>{});
+}
+
+img.addEventListener('load', fitCanvasToImg);
+window.addEventListener('resize', fitCanvasToImg);
+setTimeout(poll, 200);
+</script>)";
+
+      html += "</body></html>";
+      res.set_content(html, "text/html");
+    });
+
+    // health
+    srv_.Get("/api/health", [this](const httplib::Request&, httplib::Response& res){
+      json j;
+      j["port"] = port_;
+      j["http_fps_limit"] = http_fps_limit_;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        auto& arr = j["cams"] = json::array();
+        for (auto& kv : cams_) {
+          json c;
+          c["id"] = kv.first;
+          c["bytes"] = kv.second.bytes_total;
+          c["last_ts_us"] = kv.second.last_ts_us;
+          arr.push_back(std::move(c));
+        }
+      }
+      res.set_content(j.dump(), "application/json");
+    });
+
+    // последний JPEG
+    srv_.Get(R"(/api/frame/(.+)\.jpg)", [this](const httplib::Request& req, httplib::Response& res){
+      const std::string cam = req.matches[1];
+      std::vector<uint8_t> jpg;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        auto it = cams_.find(cam);
+        if (it != cams_.end()) jpg = it->second.last_jpeg;
+      }
+      if (jpg.empty()) { res.status = 503; res.set_content("no frame", "text/plain"); return; }
+      res.set_content(std::string((const char*)jpg.data(), jpg.size()), "image/jpeg");
+    });
+
+    // глобальные метаданные → выдать только для конкретной камеры
+    srv_.Get(R"(/api/last/(.+)\.json)", [this](const httplib::Request& req, httplib::Response& res){
+      serve_last_json(req.matches[1], res);
+    });
+    srv_.Get("/api/last.json", [this](const httplib::Request& req, httplib::Response& res){
+      std::string cam = req.get_param_value("cam");
+      serve_last_json(cam, res);
+    });
+
+    // активная камера
+    srv_.Post(R"(/api/active/(.+))", [this](const httplib::Request& req, httplib::Response& res){
+      const std::string cam = req.matches[1];
+      OnSwitchCamera cb;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        cb = on_switch_;
+      }
+      if (cb) cb(cam);
+      res.set_content("ok", "text/plain");
+    });
+
+    // MJPEG stream
+    srv_.Get(R"(/api/stream/(.+)\.mjpg)", [this](const httplib::Request& req, httplib::Response& res){
+      const std::string cam = req.matches[1];
+      res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.set_header("Pragma", "no-cache");
+      res.set_header("Connection", "keep-alive");
+
+      res.set_chunked_content_provider("multipart/x-mixed-replace; boundary=frame",
+        [this, cam](size_t, httplib::DataSink& sink){
+          usec_t last_ts_sent = 0;
+          auto last_push = Clock::now();
+
+          while (true) {
+            std::vector<uint8_t> jpg;
+            usec_t ts = 0;
+            {
+              std::unique_lock<std::mutex> lk(m_);
+              cv_.wait_for(lk, 1000ms, [&]{
+                auto it = cams_.find(cam);
+                if (it == cams_.end()) return false;
+                return !it->second.last_jpeg.empty() && it->second.last_ts_us != last_ts_sent;
+              });
+              auto it = cams_.find(cam);
+              if (it != cams_.end()) {
+                jpg = it->second.last_jpeg;
+                ts  = it->second.last_ts_us;
+              }
+              if (!running_) return true; // stop stream gracefully
+            }
+            if (jpg.empty()) continue;
+
+            // http fps limit
+            if (http_fps_limit_ > 0) {
+              auto now = Clock::now();
+              double elapsed = std::chrono::duration<double>(now - last_push).count();
+              double min_dt = 1.0 / http_fps_limit_;
+              if (elapsed < min_dt) {
+                auto ms = std::chrono::duration<double>(min_dt - elapsed);
+                std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(ms));
+              }
+              last_push = Clock::now();
+            }
+
+            std::string header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                               + std::to_string(jpg.size()) + "\r\n\r\n";
+            if (!sink.write(header.data(), header.size())) return false;
+            if (!sink.write((const char*)jpg.data(), jpg.size())) return false;
+            if (!sink.write("\r\n", 2)) return false;
+            last_ts_sent = ts;
+          }
+          return true;
+        },
+        [](bool){});
+    });
+  }
+
+  void serve_last_json(const std::string& cam, httplib::Response& res) {
+    json out;
+    std::vector<GlobalObject> snapshot;
+    usec_t ts = 0;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      snapshot = last_meta_; // копия
+      ts = last_meta_ts_;
+    }
+
+    // фильтрация по камере
+    json items = json::array();
+    for (const auto& g : snapshot) {
+      if (!cam.empty() && g.cam_id != cam) continue;
+      json o;
+      o["id"]    = g.id;
+      o["cam"]   = g.cam_id;
+      o["ts_us"] = g.last_track.ts_us;
+      o["score"] = g.last_track.box.score;
+      o["cls"]   = g.last_track.box.cls;
+
+      json b;
+      b["x"] = g.last_track.box.x;
+      b["y"] = g.last_track.box.y;
+      b["w"] = g.last_track.box.w;
+      b["h"] = g.last_track.box.h;
+      o["box"] = std::move(b);
+
+      items.push_back(std::move(o));
+    }
+
+    // попробуем угадать размеры изображения из health (необязательно, UI сам подстроится под <img>)
+    int iw = 0, ih = 0;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      auto it = cams_.find(cam);
+      if (it != cams_.end()) {
+        // размеров нет в состоянии — можно добавить при желании в PushRenderedFrame
+        // оставим 0, UI возьмёт naturalWidth/Height <img>
+      }
+    }
+
+    out["cam"]   = cam;
+    out["ts_us"] = ts;
+    out["items"] = std::move(items);
+    out["image_w"] = iw;
+    out["image_h"] = ih;
+    res.set_content(out.dump(), "application/json");
+  }
+
+private:
+  // http
+  httplib::Server  srv_;
+  std::thread      th_;
+  int              port_{8080};
+  int              http_fps_limit_{0};
+
+  // state
+  std::unordered_map<CamId, CamState> cams_;
+  std::vector<GlobalObject>           last_meta_;
+  usec_t                              last_meta_ts_{0};
+
+  OnSwitchCamera                      on_switch_;
+
+  // sync
+  std::mutex              m_;
+  std::condition_variable cv_;
+  bool                    running_{false};
+};
+
+std::unique_ptr<WebServer> CreateWebServer() {
+  return std::make_unique<SimpleWebServer>();
+}
+
+} // namespace mc

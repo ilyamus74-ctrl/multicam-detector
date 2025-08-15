@@ -1,4 +1,3 @@
-
 #pragma once
 #include <string>
 #include <vector>
@@ -43,27 +42,12 @@ struct GlobalObject {
   usec_t last_seen_us;
 };
 
-// Формат кадра
-enum class FrameFormat {
-  UNKNOWN = 0,
-  MJPG,      // внутри jpeg_data/jpeg_size валидны
-  NV12,
-  RGB888
-};
-
-// Пакет кадра → инференс/стриминг
+// Пакет кадра → инференс
 struct FramePacket {
-  CamId   cam_id;
-  int     frame_w = 0, frame_h = 0;  // размеры кадра
-  usec_t  ts_us   = 0;
-
-  FrameFormat fmt = FrameFormat::UNKNOWN;
-
-  // Если fmt == MJPG — здесь лежит готовый JPEG буфер
-  const uint8_t* jpeg_data = nullptr;
-  size_t         jpeg_size = 0;
-
-  // Если кадр сырой (NV12/RGB) — можно положить сюда
+  CamId cam_id;
+  int frame_w, frame_h;       // размеры кадра
+  usec_t ts_us;
+  // Raw / RGB / NV12 — что используешь внутри (тут только forward-указатель)
   void* image_ptr = nullptr;  // ответственность владения на стороне захвата
 };
 

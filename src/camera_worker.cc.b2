@@ -1,0 +1,256 @@
+
+#include "camera_worker.h"
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <vector>
+#include <cstring>
+#include <cerrno>
+
+// V4L2
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace mc {
+
+namespace {
+static inline int xioctl(int fd, unsigned long req, void* arg) {
+  int r;
+  do { r = ::ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
+  return r;
+}
+}
+
+class CameraWorkerImpl : public CameraWorker {
+  CameraOpenParams p_;
+
+  int fd_ = -1;
+  struct Buffer { void* start=nullptr; size_t length=0; };
+  std::vector<Buffer> bufs_;
+
+  std::thread th_;
+  std::atomic<bool> run_{false};
+  std::atomic<CamState> st_{CamState::INIT};
+
+  OnFrameCb       on_frame_;
+  OnDetectionsCb  on_dets_;
+
+  int luma_ = 120;
+  std::string prof_ = "indoor";
+
+  bool open_device(const std::string& dev) {
+    fd_ = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
+    if (fd_ < 0) {
+      std::cerr << "[v4l2] open failed: " << dev << " (" << strerror(errno) << ")\n";
+      return false;
+    }
+    return true;
+  }
+
+  bool set_format() {
+    // fmt
+    v4l2_format fmt{};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width  = p_.width;
+    fmt.fmt.pix.height = p_.height;
+    fmt.fmt.pix.pixelformat = (p_.pixfmt == "MJPG") ? V4L2_PIX_FMT_MJPEG : V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field  = V4L2_FIELD_ANY;
+    if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
+      std::cerr << "[v4l2] VIDIOC_S_FMT failed: " << strerror(errno) << "\n";
+      return false;
+    }
+
+    // fps
+    v4l2_streamparm sp{};
+    sp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    sp.parm.capture.timeperframe.numerator   = 1;
+    sp.parm.capture.timeperframe.denominator = (p_.fps > 0 ? p_.fps : 30);
+    (void)xioctl(fd_, VIDIOC_S_PARM, &sp); // best-effort
+
+    return true;
+  }
+
+  bool init_mmap() {
+    v4l2_requestbuffers req{};
+    req.count = 4;
+    req.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory= V4L2_MEMORY_MMAP;
+
+    if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0) {
+      std::cerr << "[v4l2] VIDIOC_REQBUFS failed: " << strerror(errno) << "\n";
+      return false;
+    }
+    if (req.count < 2) {
+      std::cerr << "[v4l2] not enough buffers\n";
+      return false;
+    }
+
+    bufs_.resize(req.count);
+    for (uint32_t i=0;i<req.count;++i) {
+      v4l2_buffer buf{};
+      buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index  = i;
+      if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+        std::cerr << "[v4l2] VIDIOC_QUERYBUF failed: " << strerror(errno) << "\n";
+        return false;
+      }
+      bufs_[i].length = buf.length;
+      bufs_[i].start  = ::mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
+      if (bufs_[i].start == MAP_FAILED) {
+        std::cerr << "[v4l2] mmap failed: " << strerror(errno) << "\n";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool start_streaming() {
+    for (uint32_t i=0;i<bufs_.size();++i) {
+      v4l2_buffer buf{};
+      buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index  = i;
+      if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
+        std::cerr << "[v4l2] VIDIOC_QBUF failed: " << strerror(errno) << "\n";
+        return false;
+      }
+    }
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
+      std::cerr << "[v4l2] VIDIOC_STREAMON failed: " << strerror(errno) << "\n";
+      return false;
+    }
+    return true;
+  }
+
+  void stop_streaming() {
+    if (fd_ < 0) return;
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    xioctl(fd_, VIDIOC_STREAMOFF, &type);
+  }
+
+  void uninit_mmap() {
+    for (auto& b : bufs_) {
+      if (b.start && b.start != MAP_FAILED) ::munmap(b.start, b.length);
+      b.start = nullptr; b.length = 0;
+    }
+    bufs_.clear();
+  }
+
+  void close_device() {
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+  }
+
+public:
+  ~CameraWorkerImpl() override { Stop(); }
+
+  bool Start(const CameraOpenParams& p) override {
+    p_ = p;
+
+    if (!open_device(p_.dev_path)) return false;
+    if (!set_format()) { close_device(); return false; }
+    if (!init_mmap())  { close_device(); return false; }
+    if (!start_streaming()) { uninit_mmap(); close_device(); return false; }
+
+    run_ = true;
+    st_ = CamState::RUN;
+    th_ = std::thread([this]{
+      using namespace std::chrono;
+      const int fps = std::max(1, p_.fps);
+      const auto max_wait = milliseconds(1000 / fps);
+      int counter = 0;
+
+      while (run_) {
+        // select с таймаутом, чтобы можно было прерывать
+        fd_set fds; FD_ZERO(&fds); FD_SET(fd_, &fds);
+        timeval tv{};
+        tv.tv_sec  = 0;
+        tv.tv_usec = static_cast<suseconds_t>(max_wait.count() * 1000);
+        int r = ::select(fd_+1, &fds, nullptr, nullptr, &tv);
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          std::cerr << "[v4l2] select error: " << strerror(errno) << "\n";
+          break;
+        }
+        if (r == 0) continue; // таймаут
+
+        v4l2_buffer buf{};
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
+          if (errno == EAGAIN) continue;
+          std::cerr << "[v4l2] VIDIOC_DQBUF failed: " << strerror(errno) << "\n";
+          break;
+        }
+
+        auto now_us = duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+
+        // Сформировать пакет: MJPG
+        FramePacket f{};
+        f.cam_id     = p_.cam_id;
+        f.frame_w    = p_.width;
+        f.frame_h    = p_.height;
+        f.ts_us      = static_cast<usec_t>(now_us);
+        f.fmt        = (p_.pixfmt == "MJPG") ? FrameFormat::MJPG : FrameFormat::UNKNOWN;
+        if (f.fmt == FrameFormat::MJPG) {
+          f.jpeg_data = static_cast<const uint8_t*>(bufs_[buf.index].start);
+          f.jpeg_size = buf.bytesused;
+        }
+
+        if (on_frame_) on_frame_(std::move(f));
+
+        // имитация «детекций» раз в 10 кадров — просто чтобы видеть метаданные
+        if (on_dets_ && (++counter % 10 == 0)) {
+          Detection d{};
+          d.box = { float((counter*13) % std::max(1,p_.width)),
+                    float((counter*7 ) % std::max(1,p_.height)),
+                    60, 60, 0.85f, 0 };
+          d.ts_us = static_cast<usec_t>(now_us);
+          std::vector<Detection> v; v.push_back(d);
+          on_dets_(p_.cam_id, d.ts_us, std::move(v));
+        }
+
+        // вернуть буфер драйверу
+        if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
+          std::cerr << "[v4l2] VIDIOC_QBUF (requeue) failed: " << strerror(errno) << "\n";
+          break;
+        }
+      }
+
+      stop_streaming();
+      uninit_mmap();
+      close_device();
+      st_ = CamState::STOPPED;
+    });
+
+    return true;
+  }
+
+  void Stop() override {
+    if (!run_) return;
+    run_ = false;
+    if (th_.joinable()) th_.join();
+  }
+
+  CamState State() const override { return st_.load(); }
+
+  void SetOnFrame(OnFrameCb cb) override { on_frame_ = std::move(cb); }
+  void SetOnDetections(OnDetectionsCb cb) override { on_dets_ = std::move(cb); }
+
+  void ForceProfile(const std::string& name) override { prof_ = name; }
+  int  CurrentLuma() const override { return luma_; }
+  std::string CurrentProfile() const override { return prof_; }
+};
+
+std::unique_ptr<CameraWorker> CreateCameraWorker() {
+  return std::make_unique<CameraWorkerImpl>();
+}
+
+} // namespace mc

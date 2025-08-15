@@ -1,0 +1,276 @@
+
+// src/web_server.cc
+#include "web_server.h"
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <iostream>
+
+using json = nlohmann::json;
+using namespace std::chrono_literals;
+
+namespace mc {
+
+class WebServerImpl : public WebServer {
+public:
+  WebServerImpl() = default;
+  ~WebServerImpl() override { Stop(); }
+
+  bool Start(const WebServerConfig& cfg) override {
+    if (running_) return true;
+
+    cfg_ = cfg;
+    srv_.set_read_timeout(5, 0);
+    srv_.set_write_timeout(5, 0);
+    srv_.set_keep_alive_max_count(100);
+    srv_.set_payload_max_length(1 * 1024 * 1024);
+
+    // CORS (чтобы удобно открывать со сторонних страниц)
+    srv_.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
+      res.set_header("Access-Control-Allow-Origin",  "*");
+      res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.set_header("Access-Control-Allow-Headers","Content-Type, Authorization");
+      return httplib::Server::HandlerResponse::Unhandled;
+    });
+    srv_.Options(".*", [](const httplib::Request&, httplib::Response&){});
+
+    // ==== INDEX ====
+    srv_.Get("/", [this](const httplib::Request&, httplib::Response& res) {
+      std::string html;
+      html += "<!doctype html><html><head><meta charset='utf-8'><title>multicam</title>"
+              "<style>body{font-family:sans-serif;margin:20px;}a{margin-right:12px;}code{background:#eee;padding:2px 4px;border-radius:4px;} </style>"
+              "</head><body>";
+      html += "<h3>MultiCam Debug Index</h3>";
+
+      // список камер, про которые уже видели кадры
+      std::vector<std::string> ids;
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        ids.reserve(buffers_.size());
+        for (auto &kv : buffers_) ids.push_back(kv.first);
+      }
+      if (ids.empty()) {
+        html += "<p>Пока кадров нет. Откройте <code>/cam/&lt;id&gt;</code> после того, как пойдут кадры, или нажмите кнопки в основном UI.</p>";
+      } else {
+        html += "<ul>";
+        for (auto& id : ids) {
+          html += "<li><a href='/cam/" + id + "'>/cam/" + id + "</a> &nbsp;"
+                  "<a href='/api/switch/" + id + "'>(set active)</a> &nbsp;"
+                  "<a href='/api/stream/" + id + ".mjpg'>(mjpg)</a></li>";
+        }
+        html += "</ul>";
+      }
+
+      html += "<p>Служебное: <a href='/api/health'>/api/health</a></p>";
+      html += "</body></html>";
+      res.set_content(html, "text/html; charset=utf-8");
+    });
+
+    // ==== КАМЕРА-СТРАНИЦА ====
+    // /cam/<id>
+    srv_.Get(R"(/cam/(.+))", [this](const httplib::Request& req, httplib::Response& res){
+      std::string cam = req.matches[1];
+      // простая страница: кнопка "сделать активной" + тег <img> на поток
+      std::string html;
+      html += "<!doctype html><html><head><meta charset='utf-8'><title>cam " + cam + "</title>"
+              "<style>body{font-family:sans-serif;margin:0;background:#111;color:#ddd}header{padding:10px;background:#222;position:sticky;top:0}"
+              "button{padding:8px 12px;border:0;border-radius:6px;background:#3a6ff7;color:#fff;margin-right:10px;cursor:pointer}"
+              ".wrap{display:flex;justify-content:center;}</style></head><body>";
+      html += "<header><button onclick=\"fetch('/api/switch/" + cam + "').then(()=>console.log('switch ok'))\">Set Active</button>"
+              "<a href='/' style='color:#9cf'>index</a></header>";
+      html += "<div class='wrap'><img id='v' src='/api/stream/" + cam + ".mjpg' style='max-width:100%;height:auto;'/></div>";
+      html += "</body></html>";
+      res.set_content(html, "text/html; charset=utf-8");
+    });
+
+    // ==== ПЕРЕКЛЮЧЕНИЕ АКТИВНОЙ КАМЕРЫ ====
+    // /api/switch/<id>
+    srv_.Get(R"(/api/switch/(.+))", [this](const httplib::Request& req, httplib::Response& res){
+      std::string cam = req.matches[1];
+      if (on_switch_) on_switch_(cam);
+      json j; j["ok"] = true; j["cam"] = cam;
+      res.set_content(j.dump(), "application/json");
+    });
+
+    // ==== MJPEG ПОТОК КОНКРЕТНОЙ КАМЕРЫ ====
+    // /api/stream/<id>.mjpg
+    srv_.Get(R"(/api/stream/(.+)\.mjpg)", [this](const httplib::Request& req, httplib::Response& res){
+      const std::string cam = req.matches[1];
+
+      // забираем/создаём буфер камеры
+      std::shared_ptr<CamBuf> buf = ensure_cam_buf_(cam);
+      res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.set_header("Pragma", "no-cache");
+      res.set_header("Connection", "keep-alive");
+
+      auto last_push = std::chrono::steady_clock::now();
+      res.set_chunked_content_provider(
+        "multipart/x-mixed-replace; boundary=frame",
+        [this, buf, last_push](size_t, httplib::DataSink& sink) mutable {
+          while (running_) {
+            std::vector<uint8_t> jpg;
+            {
+              std::unique_lock<std::mutex> lk(buf->m);
+              // ждём новый/любой кадр
+              buf->cv.wait_for(lk, 1500ms, [&]{ return !buf->jpg.empty() || !running_; });
+              if (!running_) break;
+              jpg = buf->jpg; // копию наружу
+            }
+
+            // HTTP FPS лимит (общий)
+            if (cfg_.fps_limit > 0) {
+              auto now = std::chrono::steady_clock::now();
+              double elapsed = std::chrono::duration<double>(now - last_push).count();
+              double min_dt  = 1.0 / std::max(1, cfg_.fps_limit);
+              if (elapsed < min_dt) {
+                auto sleep_d = std::chrono::duration<double>(min_dt - elapsed);
+                std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::milliseconds>(sleep_d));
+              }
+              last_push = std::chrono::steady_clock::now();
+            }
+
+            // отдать партишн
+            std::string header = "--frame\r\n"
+                                 "Content-Type: image/jpeg\r\n"
+                                 "Content-Length: " + std::to_string(jpg.size()) + "\r\n\r\n";
+            if (!sink.write(header.data(), header.size())) break;
+            if (!sink.write(reinterpret_cast<const char*>(jpg.data()), jpg.size())) break;
+            if (!sink.write("\r\n", 2)) break;
+            std::this_thread::sleep_for(2ms);
+          }
+          return true;
+        },
+        [](bool){});
+    });
+
+    // ==== HEALTH ====
+    srv_.Get("/api/health", [this](const httplib::Request&, httplib::Response& res){
+      json j;
+      j["port"] = cfg_.port;
+      j["http_fps_limit"] = cfg_.fps_limit;
+
+      json cams = json::array();
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        for (auto& kv : buffers_) {
+          json c; c["id"] = kv.first; c["last_ts_us"] = kv.second->ts_us; c["bytes"] = kv.second->jpg.size();
+          cams.push_back(std::move(c));
+        }
+      }
+      j["cams"] = std::move(cams);
+      res.set_content(j.dump(), "application/json");
+    });
+
+    // ==== last meta ====
+    srv_.Get("/api/last.json", [this](const httplib::Request&, httplib::Response& res){
+      json j = json::object();
+      {
+        std::lock_guard<std::mutex> lk(meta_m_);
+        j = last_meta_.is_null() ? json::object() : last_meta_;
+      }
+      res.set_content(j.dump(), "application/json");
+    });
+
+    running_ = true;
+    th_ = std::thread([this] {
+      std::cout << "[http] listen on 0.0.0.0:" << cfg_.port << "\n";
+      srv_.listen("0.0.0.0", cfg_.port);
+    });
+    return true;
+  }
+
+  void Stop() override {
+    if (!running_) return;
+    running_ = false;
+    srv_.stop();
+    // разбудить всех, чтобы поток стриминга корректно вышел
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      for (auto& kv : buffers_) kv.second->cv.notify_all();
+    }
+    if (th_.joinable()) th_.join();
+  }
+
+  void PushRenderedFrame(const CamId& cam, const void* jpg_data, size_t jpg_size, usec_t ts_us) override {
+    if (!jpg_data || jpg_size == 0) return;
+
+    auto buf = ensure_cam_buf_(cam);
+    {
+      std::lock_guard<std::mutex> lk(buf->m);
+      buf->jpg.assign(static_cast<const uint8_t*>(jpg_data),
+                      static_cast<const uint8_t*>(jpg_data) + jpg_size);
+      buf->ts_us = ts_us;
+    }
+    buf->cv.notify_all();
+  }
+
+  void PushMeta(const std::vector<GlobalObject>& objs, usec_t ts_us) override {
+    (void)ts_us;
+    json arr = json::array();
+    for (auto& o : objs) {
+      json jo;
+      jo["gid"] = o.id;
+      jo["cam"] = o.cam_id;
+      jo["ts_us"] = o.last_seen_us;
+      jo["box"] = { {"x", o.last_track.box.x}, {"y", o.last_track.box.y},
+                    {"w", o.last_track.box.w}, {"h", o.last_track.box.h},
+                    {"score", o.last_track.box.score}, {"cls", o.last_track.box.cls} };
+      arr.push_back(std::move(jo));
+    }
+    {
+      std::lock_guard<std::mutex> lk(meta_m_);
+      last_meta_ = std::move(arr);
+    }
+  }
+
+  void SetOnSwitchCamera(OnSwitchCamera cb) override {
+    on_switch_ = std::move(cb);
+  }
+
+private:
+  struct CamBuf {
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<uint8_t> jpg;
+    usec_t ts_us = 0;
+  };
+
+  std::shared_ptr<CamBuf> ensure_cam_buf_(const CamId& id) {
+    std::lock_guard<std::mutex> lk(m_);
+    auto it = buffers_.find(id);
+    if (it != buffers_.end()) return it->second;
+    auto p = std::make_shared<CamBuf>();
+    buffers_[id] = p;
+    return p;
+  }
+
+private:
+  WebServerConfig cfg_{};
+  httplib::Server srv_;
+  std::thread th_;
+  std::atomic<bool> running_{false};
+
+  std::mutex m_; // guards buffers_
+  std::unordered_map<CamId, std::shared_ptr<CamBuf>> buffers_;
+
+  // meta
+  std::mutex meta_m_;
+  json last_meta_;
+
+  // callbacks
+  OnSwitchCamera on_switch_;
+};
+
+std::unique_ptr<WebServer> CreateWebServer() {
+  return std::make_unique<WebServerImpl>();
+}
+
+} // namespace mc

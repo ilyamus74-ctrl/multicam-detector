@@ -1,0 +1,63 @@
+// include/common_types.h
+#pragma once
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <optional>
+#include <memory>
+
+namespace mc {
+
+// ==== ids & time start ====
+using CamId         = std::string;
+using LocalTrackId  = int32_t;
+using GlobalId      = int64_t;
+using usec_t        = uint64_t;
+// ==== ids & time end ====
+
+// ==== boxes/dets/tracks start ====
+struct BBox {
+  float x, y, w, h;   // px
+  float score;        // 0..1
+  int   cls;          // class index
+};
+
+struct Detection {
+  BBox   box;
+  usec_t ts_us;
+};
+
+struct Track {
+  LocalTrackId         track_id;
+  BBox                 box;
+  usec_t               ts_us;
+  std::optional<float> vx, vy; // px/s
+};
+
+struct GlobalObject {
+  GlobalId id;
+  CamId    cam_id;
+  Track    last_track;
+  usec_t   last_seen_us;
+};
+// ==== boxes/dets/tracks end ====
+
+// ==== FramePacket start ====
+// Пакет кадра → в NPU; дополнен полями для готового JPEG (если есть)
+struct FramePacket {
+  CamId   cam_id;
+  int     frame_w = 0;
+  int     frame_h = 0;
+  usec_t  ts_us   = 0;
+
+  // Сырые/межуточные данные (владение на стороне захвата)
+  void*   image_ptr = nullptr;
+
+  // NEW: если пришёл уже MJPG из камеры или ты сделал JPEG-энкод —
+  //     можно сразу транслировать в веб:
+  const uint8_t* jpeg_data = nullptr;
+  size_t         jpeg_size = 0;
+};
+// ==== FramePacket end ====
+
+} // namespace mc

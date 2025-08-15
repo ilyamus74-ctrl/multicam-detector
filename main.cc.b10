@@ -1,6 +1,5 @@
 
 // main.cc
-
 #include <atomic>
 #include <csignal>
 #include <chrono>
@@ -30,17 +29,9 @@ struct CliOptions {
   std::optional<int>     http_fps_limit_cli;
 };
 
-// Глобальный флаг завершения
 static std::atomic<bool> g_run{true};
+static void on_signal(int){ g_run = false; }
 
-// =============== Сигналы ===============
-// on_signal start
-static void on_signal(int) { g_run = false; }
-// on_signal end
-
-// ===============================
-// Утилиты: чтение файла в строку
-// ===============================
 // read_text_file start
 static bool read_text_file(const std::string& path, std::string& out, std::string& err) {
   std::ifstream ifs(path);
@@ -50,9 +41,6 @@ static bool read_text_file(const std::string& path, std::string& out, std::strin
 }
 // read_text_file end
 
-// =========================
-// Загрузка минимального HTTP
-// =========================
 // load_http_minimal start
 static bool load_http_minimal(const std::string& json_path, HttpMinimal& http, std::string& err) {
   std::string txt;
@@ -81,16 +69,14 @@ static bool load_http_minimal(const std::string& json_path, HttpMinimal& http, s
     }
   };
 
-  find_int("\"port\"",            http.port);
-  find_int("\"http_fps_limit\"",  http.fps_limit);
-  find_str("\"display_camera\"",  http.display_camera);
+  find_int("\"port\"", http.port);
+  find_int("\"http_fps_limit\"", http.fps_limit);
+  find_str("\"display_camera\"", http.display_camera);
+
   return true;
 }
 // load_http_minimal end
 
-// ===========================
-// Парсинг аргументов командной
-// ===========================
 // parse_cli start
 static CliOptions parse_cli(int argc, char** argv) {
   CliOptions opt;
@@ -115,16 +101,12 @@ static CliOptions parse_cli(int argc, char** argv) {
 }
 // parse_cli end
 
-// ==========================
-// Класс рантайма приложения
-// ==========================
 // AppRuntime class start
 class AppRuntime {
 public:
   AppRuntime()  = default;
   ~AppRuntime() { Stop();      }
 
-  // AppRuntime::Start start
   bool Start(const std::string& config_path, const HttpMinimal& http_cfg) {
     std::cout << "Loading config: " << config_path << "\n";
 
@@ -143,7 +125,7 @@ public:
     if (!cams_) cams_ = mc::CreateCameraManager();
     if (!cams_) { std::cerr << "[bootstrap] CreateCameraManager failed\n"; return false; }
 
-    // 3) Коллбек из веба — переключить камеру
+    // 3) Веб → переключение камеры
     http_->SetOnSwitchCamera([this](const mc::CamId& cam){
       std::cout << "[http] switch camera -> " << cam << "\n";
       if (cams_) cams_->SetDisplayCamera(cam);
@@ -156,27 +138,18 @@ public:
       }
     );
 
-    // 5) Готовые кадры → в веб
+    // 5) NEW: готовые кадры → пуш в веб
     cams_->SetOnRenderedFrame(
       [this](const mc::CamId& cam, const void* jpg, size_t jsize, mc::usec_t ts){
         if (http_ && jpg && jsize) http_->PushRenderedFrame(cam, jpg, jsize, ts);
       }
     );
 
-    // 6) ВАЖНО: читаем ПОЛНЫЙ конфиг для камер
-    mc::AppConfig app_cfg{};
-    if (!mc::LoadConfigFromFile(config_path, &app_cfg)) {
-      std::cerr << "[bootstrap] LoadConfigFromFile failed\n";
-      return false;
-    }
-
-    // 7) Стартуем камеры
+    mc::AppConfig app_cfg{}; // пока дефолт
     if (!cams_->Start(app_cfg)) {
       std::cerr << "[bootstrap] CameraManager start failed\n";
       return false;
     }
-
-    // 8) Применим display_camera после старта
     if (!http_cfg.display_camera.empty()) {
       cams_->SetDisplayCamera(http_cfg.display_camera);
     }
@@ -184,16 +157,13 @@ public:
     started_ = true;
     return true;
   }
-  // AppRuntime::Start end
 
-  // AppRuntime::Stop start
   void Stop() {
     if (!started_) return;
     if (cams_) cams_->Stop();
     if (http_) http_->Stop();
     started_ = false;
   }
-  // AppRuntime::Stop end
 
 private:
   bool started_ = false;
@@ -202,21 +172,17 @@ private:
 };
 // AppRuntime class end
 
-// ==================
 // main function start
-// ==================
 int main(int argc, char** argv) {
   std::signal(SIGINT,  on_signal);
   std::signal(SIGTERM, on_signal);
 
-  // 1) CLI
   CliOptions cli = parse_cli(argc, argv);
   if (cli.config_path.empty()) {
     std::cerr << "Config load failed: --config\n";
     return 2;
   }
 
-  // 2) Мини-HTTP конфиг (порт/лимит/камера по умолчанию)
   HttpMinimal http_cfg;
   {
     std::string err;
@@ -231,7 +197,6 @@ int main(int argc, char** argv) {
             << ", http_fps_limit=" << http_cfg.fps_limit
             << ", display_camera=\"" << (http_cfg.display_camera.empty()?": ":http_cfg.display_camera) << "\")\n";
 
-  // 3) Рантайм
   AppRuntime app;
   if (!app.Start(cli.config_path, http_cfg)) return 3;
 
@@ -240,6 +205,4 @@ int main(int argc, char** argv) {
   app.Stop();
   return 0;
 }
-// =================
 // main function end
-// =================
